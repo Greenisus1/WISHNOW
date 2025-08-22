@@ -64,7 +64,6 @@ ensure_deps() {
   # Suggest xdg-utils for opening links, but don't require it
   if ! require_cmd xdg-open; then
     log "Tip: Install xdg-utils to auto-open Amazon links (sudo apt install xdg-utils)."
-  }
 }
 
 # Simple INI
