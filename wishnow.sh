@@ -1,361 +1,590 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =========================================
+# WISHNOW — single-file Pi app with LemonAI
+# - Whiptail UI (no heavy deps)
+# - Persistent config & memory (~/.wishnow)
+# - Personality quiz
+# - LemonAI ideas (offline rules, learns from feedback)
+# - "Like" adds idea to wishes automatically
+# - Amazon search by opening a browser link (no API keys)
+# - Self-update from GitHub (optional)
+# =========================================
 
-# =========================
-# WISHNOW - single-file app
-# =========================
+set -euo pipefail
 
-CONFIG_DIR="/usr/local/etc/WISHNOW/user"
-NAME_FILE="$CONFIG_DIR/NAME.txt"
-SETTINGS_DIR="$CONFIG_DIR/SETTINGS"
-WISHES_DIR="$CONFIG_DIR/WISHES"
-GENERATED_NAMES="$SETTINGS_DIR/generated-names.txt"
+APP_NAME="WISHNOW"
+APP_VERSION="1.0.0"
+AUTHOR="Liam & Copilot"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Greenisus1/WISHNOW/main/wishnow.sh"
 
-# Ensure storage paths exist
-sudo mkdir -p "$CONFIG_DIR" "$SETTINGS_DIR" "$WISHES_DIR"
-sudo touch "$GENERATED_NAMES"
+# Paths
+CONFIG_DIR="${HOME}/.wishnow"
+WISHES_FILE="${CONFIG_DIR}/wishes.txt"
+MEMORY_FILE="${CONFIG_DIR}/lemonAI_memory.json"
+SETTINGS_FILE="${CONFIG_DIR}/settings.ini"
+TMP_DIR="${CONFIG_DIR}/tmp"
+LOG_FILE="${CONFIG_DIR}/wishnow.log"
 
-# --- First run setup ---
-if [ ! -f "$NAME_FILE" ]; then
-    echo "HELLO USER!"
-    read -p "WHAT SHOULD I CALL YOU? NAME: " nickname
-    echo "NICKNAME=$nickname" | sudo tee "$NAME_FILE" >/dev/null
-    echo "HELLO $nickname"
-else
-    nickname=$(grep -m1 "^NICKNAME=" "$NAME_FILE" | cut -d'=' -f2)
-    [ -z "$nickname" ] && nickname="FRIEND"
-    echo "HELLO $nickname"
-fi
+# Defaults
+DEFAULT_AI_MODE="offline"        # offline (no network needed)
+DEFAULT_AI_ENDPOINT=""           # optional (e.g., http://localhost:11434/api/generate for local Ollama) — not required
+DEFAULT_AMAZON_OPEN="ask"        # ask | auto | off (open browser for Amazon search links)
 
-# --- Helpers ---
-gen_id() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8; }
-now_stamp() { date +"%H/%M/%S/%3N/%m/%d/%Y"; }
-extract_field() { echo "$1" | sed -n "s/.*$2=\([^\\]*\).*/\1/p"; }
-reload_wishes_list() {
-    # keep only IDs that still have files; clean up stale lines
-    if [ -f "$GENERATED_NAMES" ]; then
-        tmp=$(mktemp)
-        while read -r wid; do
-            [ -f "$WISHES_DIR/$wid.txt" ] && echo "$wid"
-        done < "$GENERATED_NAMES" > "$tmp"
-        sudo mv "$tmp" "$GENERATED_NAMES"
-    fi
-    mapfile -t wishes_list < "$GENERATED_NAMES"
-    total=${#wishes_list[@]}
-}
+# --------------- Utils -------------------
 
-# --- Updater ---
-update_script() {
-    RAW_URL="https://raw.githubusercontent.com/Greenisus1/WISHNOW/main/wishnow.sh"
-    TMP_FILE=$(mktemp)
-    SCRIPT_PATH="$(realpath "$0")"
+mkdir -p "$CONFIG_DIR" "$TMP_DIR"
+touch "$LOG_FILE"
 
-    echo "Checking for updates..."
-    if ! curl -fsSL "$RAW_URL" -o "$TMP_FILE"; then
-        echo "Update failed: could not download from GitHub."
-        rm -f "$TMP_FILE"
-        return
-    fi
+log() { printf "[%s] %s\n" "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
 
-    # Basic sanity: ensure downloaded file looks like a shell script
-    if ! head -n1 "$TMP_FILE" | grep -q "#!/bin/bash"; then
-        echo "Update aborted: downloaded file is not a valid script."
-        rm -f "$TMP_FILE"
-        return
-    fi
+require_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-    if cmp -s "$SCRIPT_PATH" "$TMP_FILE"; then
-        echo "You already have the latest version."
-        rm -f "$TMP_FILE"
-        return
-    fi
+cleanup() { rm -f "$TMP_DIR"/* 2>/dev/null || true; }
+trap cleanup EXIT
 
-    echo "New version found. Applying update..."
-    # Optional backup
-    cp "$SCRIPT_PATH" "$SCRIPT_PATH.bak" 2>/dev/null || sudo cp "$SCRIPT_PATH" "$SCRIPT_PATH.bak" >/dev/null 2>&1
-
-    if cp "$TMP_FILE" "$SCRIPT_PATH" 2>/dev/null || sudo cp "$TMP_FILE" "$SCRIPT_PATH"; then
-        chmod +x "$SCRIPT_PATH" 2>/dev/null || sudo chmod +x "$SCRIPT_PATH"
-        rm -f "$TMP_FILE"
-        echo "Update complete. Restarting WISHNOW..."
-        sleep 1
-        exec "$SCRIPT_PATH"
+ensure_deps() {
+  local missing=()
+  for c in whiptail jq sed awk tr cut; do
+    require_cmd "$c" || missing+=("$c")
+  done
+  # xdg-open is optional (for Amazon links)
+  if ((${#missing[@]})); then
+    if command -v apt >/dev/null 2>&1; then
+      whiptail --yesno "Missing dependencies: ${missing[*]}\nInstall now?" 12 60 || {
+        whiptail --msgbox "Cannot continue without: ${missing[*]}" 10 60
+        exit 1
+      }
+      sudo apt update -y
+      sudo apt install -y whiptail jq
     else
-        echo "Update failed: could not overwrite script. Check permissions."
-        rm -f "$TMP_FILE"
+      whiptail --msgbox "Missing: ${missing[*]}\nPlease install them and re-run." 10 60
+      exit 1
     fi
+  fi
+  # Suggest xdg-utils for opening links, but don't require it
+  if ! require_cmd xdg-open; then
+    log "Tip: Install xdg-utils to auto-open Amazon links (sudo apt install xdg-utils)."
+  }
 }
 
-# --- New wish flow ---
-new_wish() {
-    echo "WHAT KIND OF WISH IS THIS? (AMAZON,TEXT,OTHER)"
-    read -r -p "> " wish_type
-    wish_type=$(echo "$wish_type" | tr '[:lower:]' '[:upper:]')
-
-    echo "CREATING NEW WISH..."
-
-    if [ "$wish_type" = "AMAZON" ]; then
-        echo "SELECTED : AMAZON"
-        echo "WHAT IS THE AMAZON LINK?"
-        read -r -p " LINK: " link
-        echo " AMAZON LINK ADDED"
-        echo "WHAT IS THE NAME OF THE AMAZON ITEM"
-        read -r -p "ITEM-NAME: " item_name
-
-        while true; do
-            read -r -p "IS THE LINK CORRECT: $link?(Y,n) " ans
-            case "$ans" in
-                [Nn]*)
-                    echo "WHAT IS THE CORRECT LINK?"
-                    read -r -p "LINK: " link
-                    ;;
-                [Yy]*|"") break ;;
-                *) echo "Please answer Y or n." ;;
-            esac
-        done
-
-        while true; do
-            read -r -p "IS THE ITEM NAME CORRECT: $item_name?(Y,n) " ans
-            case "$ans" in
-                [Nn]*)
-                    echo "WHAT IS THE CORRECT ITEM NAME?"
-                    read -r -p "ITEM-NAME: " item_name
-                    ;;
-                [Yy]*|"") break ;;
-                *) echo "Please answer Y or n." ;;
-            esac
-        done
-
-        wish_id=$(gen_id)
-        echo "$wish_id" | sudo tee -a "$GENERATED_NAMES" >/dev/null
-        echo "LINK=$link \ item-name=$item_name \ date=$(now_stamp)" | sudo tee "$WISHES_DIR/$wish_id.txt" >/dev/null
-        echo "Amazon wish saved as $wish_id"
-
-    elif [ "$wish_type" = "TEXT" ]; then
-        echo "CREATING NEW TEXT WISH"
-        echo "WHAT IS THE TEXT FOR THIS WISH?"
-        read -r -p "TEXT: " text_wish
-
-        while true; do
-            read -r -p "IS THIS TEXT CORRECT: $text_wish?(Y,n) " ans
-            case "$ans" in
-                [Nn]*)
-                    echo "WHAT IS THE CORRECT TEXT?"
-                    read -r -p "TEXT: " text_wish
-                    ;;
-                [Yy]*|"") break ;;
-                *) echo "Please answer Y or n." ;;
-            esac
-        done
-
-        wish_id=$(gen_id)
-        echo "$wish_id" | sudo tee -a "$GENERATED_NAMES" >/dev/null
-        echo "TEXT=$text_wish \ date=$(now_stamp)" | sudo tee "$WISHES_DIR/$wish_id.txt" >/dev/null
-        echo "Text wish saved as $wish_id"
-
-    elif [ "$wish_type" = "OTHER" ]; then
-        echo "COMING SOON..."
-    else
-        echo "Unknown wish type."
-    fi
+# Simple INI
+ini_get() { [ -f "$SETTINGS_FILE" ] && awk -F'=' -v k="$1" '$1==k{print substr($0,index($0,"=")+1)}' "$SETTINGS_FILE" | tail -n1 || true; }
+ini_set() {
+  local key="$1" val="$2"
+  touch "$SETTINGS_FILE"
+  if grep -q "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
+    sed -i "s|^${key}=.*$|${key}=${val}|" "$SETTINGS_FILE"
+  else
+    printf "%s=%s\n" "$key" "$val" >>"$SETTINGS_FILE"
+  fi
 }
 
-# --- Wishes menu with paging ---
-show_wishes() {
-    if [ ! -s "$GENERATED_NAMES" ]; then
-        echo "No wishes yet."
-        return
-    fi
+# JSON memory helpers
+ensure_memory() {
+  if [ ! -f "$MEMORY_FILE" ]; then
+    cat >"$MEMORY_FILE" <<'JSON'
+{
+  "personality": {
+    "name": "",
+    "traits": [],
+    "mbti": ""
+  },
+  "preferences": {
+    "likes": [],
+    "dislikes": [],
+    "tag_scores": {}
+  },
+  "history": []
+}
+JSON
+  fi
+}
 
-    reload_wishes_list
-    page=0
-    per_page=9
+memory_set_name() {
+  local name="$1" tmp="${TMP_DIR}/mem.tmp"
+  jq --arg n "$name" '.personality.name = $n' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-    while true; do
-        clear
-        echo "=== YOUR WISHES ==="
-        start=$((page * per_page))
-        end=$((start + per_page))
-        [ $end -gt $total ] && end=$total
+memory_set_traits_json() {
+  local traits_json="$1" tmp="${TMP_DIR}/mem.tmp"
+  jq --argjson t "$traits_json" '.personality.traits = $t' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-        # If page overflowed after deletions, pull back into range
-        if [ $start -ge $total ] && [ $total -gt 0 ]; then
-            page=$(( (total - 1) / per_page ))
-            start=$((page * per_page))
-            end=$((start + per_page))
-            [ $end -gt $total ] && end=$total
-        fi
+append_history() {
+  local msg="$1" now; now="$(date '+%F %T')"
+  local tmp="${TMP_DIR}/mem.tmp"
+  jq --arg d "$now" --arg m "$msg" '.history += [{date:$d, interaction:$m}]' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-        count_on_page=$((end - start))
-        if [ $count_on_page -le 0 ]; then
-            echo "No wishes on this page."
-        else
-            num=1
-            for ((i=start; i<end; i++)); do
-                wid="${wishes_list[$i]}"
-                wish_file="$WISHES_DIR/$wid.txt"
-                [ ! -f "$wish_file" ] && continue
-                wish_data=$(cat "$wish_file")
-                if [[ "$wish_data" == *"LINK="* ]]; then
-                    type="AMAZON"; name=$(extract_field "$wish_data" "item-name"); [ -z "$name" ] && name="(no name)"
-                elif [[ "$wish_data" == *"TEXT="* ]]; then
-                    type="TEXT"; name=$(extract_field "$wish_data" "TEXT"); [ -z "$name" ] && name="(no text)"
-                else
-                    type="OTHER"; name=$(extract_field "$wish_data" "OTHER"); [ -z "$name" ] && name="(other)"
-                fi
-                echo "$num) [$type] $name"
-                ((num++))
-            done
-        fi
+append_like() {
+  local idea="$1" tmp="${TMP_DIR}/mem.tmp"
+  jq --arg i "$idea" '.preferences.likes += [$i]' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-        [ $end -lt $total ] && echo "0) Next Page"
-        echo "X) Back to Menu"
-        read -r -p "Choose: " choice
+append_dislike() {
+  local idea="$1" tmp="${TMP_DIR}/mem.tmp"
+  jq --arg i "$idea" '.preferences.dislikes += [$i]' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-        # Next page
-        if [ "$choice" = "0" ] && [ $end -lt $total ]; then
-            ((page++))
-            continue
-        fi
+bump_tag() {
+  local tag="$1" delta="${2:-1}" tmp="${TMP_DIR}/mem.tmp"
+  jq --arg t "$tag" --argjson d "$delta" '.preferences.tag_scores[$t] = (.preferences.tag_scores[$t] // 0) + $d' "$MEMORY_FILE" >"$tmp" && mv "$tmp" "$MEMORY_FILE"
+}
 
-        # Back
-        [[ "$choice" =~ ^[Xx]$ ]] && break
+# --------------- First run & quiz -------------------
 
-        # Non-number → refresh
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            continue
-        fi
+splash() {
+  whiptail --title "$APP_NAME" --msgbox "Welcome to $APP_NAME v$APP_VERSION" 8 40
+}
 
-        # Out of range → refresh
-        if [ "$choice" -lt 1 ] || [ "$choice" -gt $((end - start)) ]; then
-            continue
-        fi
+first_run() {
+  ensure_memory
+  local name
+  name=$(whiptail --inputbox "Welcome to $APP_NAME!\nWhat should I call you?" 10 60 "" 3>&1 1>&2 2>&3) || name=""
+  [ -z "$name" ] && name="Friend"
+  ini_set "NAME" "$name"
+  ini_set "AI_MODE" "$DEFAULT_AI_MODE"
+  ini_set "AI_ENDPOINT" "$DEFAULT_AI_ENDPOINT"
+  ini_set "AMAZON_OPEN" "$DEFAULT_AMAZON_OPEN"
+  memory_set_name "$name"
+  whiptail --msgbox "Nice to meet you, $name! Let's do a quick personality setup." 10 60
+  personality_quiz
+}
 
-        # Resolve selected wish
-        index=$((start + choice - 1))
-        wid="${wishes_list[$index]}"
-        wish_file="$WISHES_DIR/$wid.txt"
-        [ ! -f "$wish_file" ] && continue
-        wish_data=$(cat "$wish_file")
+personality_quiz() {
+  ensure_memory
+  local choices=(
+    "outdoorsy"   "Loves nature and being outside" OFF
+    "creative"    "Enjoys art, writing, or making things" OFF
+    "tech-savvy"  "Into coding, gadgets, and tinkering" OFF
+    "social"      "Energized by people and events" OFF
+    "reflective"  "Likes journaling, reading, deep dives" OFF
+    "active"      "Enjoys sports and movement" OFF
+    "helper"      "Likes volunteering and service" OFF
+    "gamer"       "Enjoys games and playful challenges" OFF
+    "maker"       "Builds, crafts, DIY projects" OFF
+    "adventurous" "Likes new experiences and travel" OFF
+  )
+  local traits_raw
+  traits_raw=$(whiptail --checklist "Pick any traits that fit you" 20 70 10 "${choices[@]}" 3>&1 1>&2 2>&3) || traits_raw=""
+  # Convert space-separated quoted tokens into JSON array
+  local arr=() tok
+  for tok in $traits_raw; do
+    tok="${tok%\"}"; tok="${tok#\"}"
+    arr+=("$tok")
+  done
+  local json="["
+  local first=1
+  for t in "${arr[@]}"; do
+    if [ $first -eq 1 ]; then first=0; else json+=", "; fi
+    json+="\"$t\""
+  done
+  json+="]"
+  memory_set_traits_json "$json"
+  whiptail --msgbox "Thanks! LemonAI will tailor ideas to your personality." 10 60
+}
 
-        if [[ "$wish_data" == *"LINK="* ]]; then
-            type="AMAZON"
-        elif [[ "$wish_data" == *"TEXT="* ]]; then
-            type="TEXT"
-        else
-            type="OTHER"
-        fi
+# --------------- Wishes -------------------
 
-        # Amazon actions
-        if [ "$type" = "AMAZON" ]; then
-            link=$(extract_field "$wish_data" "LINK")
-            item_name=$(extract_field "$wish_data" "item-name")
-            echo
-            echo "Selected Amazon Wish: ${item_name:-"(no name)"}"
-            echo "1) Open Link"
-            echo "2) Delete Wish"
-            echo "3) Edit Link or Name"
-            read -r -p "Choose: " opt
-            case "$opt" in
-                1)
-                    [ -n "$link" ] && xdg-open "$link" >/dev/null 2>&1 &
-                    ;;
-                2)
-                    rm -f "$wish_file"
-                    sudo sed -i "/^$wid$/d" "$GENERATED_NAMES"
-                    reload_wishes_list
-                    ;;
-                3)
-                    read -r -p "New Link (leave blank to keep): " new_link
-                    [ -n "$new_link" ] && link="$new_link"
-                    read -r -p "New Item Name (leave blank to keep): " new_name
-                    [ -n "$new_name" ] && item_name="$new_name"
-                    echo "LINK=$link \ item-name=$item_name \ date=$(now_stamp)" > "$wish_file"
-                    ;;
-                *)
-                    : # any other input returns to list
-                    ;;
-            esac
+ensure_files() {
+  mkdir -p "$CONFIG_DIR" "$TMP_DIR"
+  touch "$WISHES_FILE" "$SETTINGS_FILE"
+  ensure_memory
+}
 
-        # Non-Amazon actions
-        else
-            echo
-            echo "Selected $type Wish"
-            echo "1) Delete Wish"
-            echo "2) Edit Wish Text"
-            read -r -p "Choose: " opt
-            case "$opt" in
-                1)
-                    rm -f "$wish_file"
-                    sudo sed -i "/^$wid$/d" "$GENERATED_NAMES"
-                    reload_wishes_list
-                    ;;
-                2)
-                    if [ "$type" = "TEXT" ]; then
-                        current=$(extract_field "$wish_data" "TEXT")
-                        read -r -p "New Text (leave blank to keep): " new_text
-                        [ -z "$new_text" ] && new_text="$current"
-                        echo "TEXT=$new_text \ date=$(now_stamp)" > "$wish_file"
-                    else
-                        current=$(extract_field "$wish_data" "OTHER")
-                        read -r -p "New Description (leave blank to keep): " new_desc
-                        [ -z "$new_desc" ] && new_desc="$current"
-                        echo "OTHER=$new_desc \ date=$(now_stamp)" > "$wish_file"
-                    fi
-                    ;;
-                *)
-                    : # any other input returns to list
-                    ;;
-            esac
-        fi
+add_wish_manual() {
+  local wish
+  wish=$(whiptail --inputbox "✨ What wish would you like to add?" 10 70 "" 3>&1 1>&2 2>&3) || return 0
+  wish="${wish//$'\n'/ }"
+  wish="${wish//$'\r'/ }"
+  [ -z "$wish" ] && whiptail --msgbox "No wish added." 8 40 && return 0
+  echo "$wish" >>"$WISHES_FILE"
+  append_history "User added wish: $wish"
+  if ask_amazon_open; then amazon_search "$wish"; fi
+}
+
+view_wishes() {
+  if [ ! -s "$WISHES_FILE" ]; then
+    whiptail --msgbox "No wishes yet. Add one!" 8 40
+    return
+  fi
+  whiptail --textbox "$WISHES_FILE" 20 70
+}
+
+manage_wishes() {
+  if [ ! -s "$WISHES_FILE" ]; then
+    whiptail --msgbox "No wishes to manage." 8 40
+    return
+  fi
+  local i=0 choices=()
+  while IFS= read -r line; do
+    i=$((i+1))
+    choices+=("$i" "$line" OFF)
+  done <"$WISHES_FILE"
+
+  local sel
+  sel=$(whiptail --checklist "Select wishes to delete" 20 80 12 "${choices[@]}" 3>&1 1>&2 2>&3) || return
+  [ -z "$sel" ] && return
+
+  local ids=()
+  local tok
+  for tok in $sel; do
+    tok="${tok%\"}"; tok="${tok#\"}"
+    ids+=("$tok")
+  done
+
+  local tmp="${TMP_DIR}/wishes.new"
+  : >"$tmp"
+  i=0
+  while IFS= read -r line; do
+    i=$((i+1))
+    local keep=1 id
+    for id in "${ids[@]}"; do
+      [ "$i" = "$id" ] && { keep=0; break; }
     done
+    [ $keep -eq 1 ] && echo "$line" >>"$tmp"
+  done <"$WISHES_FILE"
+
+  mv "$tmp" "$WISHES_FILE"
+  whiptail --msgbox "Selected wishes deleted." 8 40
 }
 
-# --- Settings ---
+# --------------- Tagging & offline ideas -------------------
+
+infer_tags() {
+  local text="${1,,}"
+  local tags=()
+  [[ "$text" =~ (hike|trail|camp|nature|outdoor|river|park) ]] && tags+=("outdoors")
+  [[ "$text" =~ (code|coding|program|pi|raspberry|script|tech|server) ]] && tags+=("tech")
+  [[ "$text" =~ (art|draw|paint|write|creative|craft|music|photo) ]] && tags+=("creative")
+  [[ "$text" =~ (friend|club|group|event|party|social|meetup) ]] && tags+=("social")
+  [[ "$text" =~ (journal|read|book|reflect|mindful|meditate) ]] && tags+=("reflective")
+  [[ "$text" =~ (run|bike|sport|workout|fitness|yoga) ]] && tags+=("active")
+  [[ "$text" =~ (help|volunteer|service|donate|mentor) ]] && tags+=("helper")
+  [[ "$text" =~ (game|minecraft|play|puzzle|speedrun|indie) ]] && tags+=("gamer")
+  [[ "$text" =~ (build|make|diy|3d print|kit|solder|laser|cnc) ]] && tags+=("maker")
+  [[ "$text" =~ (trip|travel|explore|adventure|cuisine) ]] && tags+=("adventurous")
+  printf "%s\n" "${tags[@]}"
+}
+
+offline_bank() {
+  case "$1" in
+    outdoors)
+      cat <<EOF
+Plan a sunrise hike at a nearby trail
+Start a backyard pollinator garden
+Join a local park or river cleanup
+Map a bike route you’ve never tried
+Camp under the stars this month
+EOF
+      ;;
+    tech)
+      cat <<EOF
+Build a Raspberry Pi weather station
+Automate a daily task with a shell script
+Set up a home media server on the Pi
+Create a simple website for a hobby
+Contribute a small fix to an open-source project
+EOF
+      ;;
+    creative)
+      cat <<EOF
+Start a 7-day sketch or photo challenge
+Write a one-page short story tonight
+Design a custom sticker or patch
+Make a playlist that tells a story
+Try a new craft and gift it to a friend
+EOF
+      ;;
+    social)
+      cat <<EOF
+Host a board-game night
+Invite a friend for a coffee walk
+Join a local meetup that matches a hobby
+Write a thank-you note to a mentor
+Plan a small potluck with a theme
+EOF
+      ;;
+    reflective)
+      cat <<EOF
+Begin a 5-minute daily journal
+Curate a reading list of 3 books
+Do a weekly digital detox hour
+Reflect on 3 wins from the past week
+Write a letter to your future self
+EOF
+      ;;
+    active)
+      cat <<EOF
+Try a new bodyweight routine
+Bike to an errand instead of driving
+Learn a simple yoga flow
+Do a weekend 5k route with friends
+Track steps for a fun weekly goal
+EOF
+      ;;
+    helper)
+      cat <<EOF
+Volunteer one hour this week
+Assemble a small care kit for donation
+Offer free tech help to a neighbor
+Organize a mini drive (books, coats, food)
+Mentor someone starting in your field
+EOF
+      ;;
+    gamer)
+      cat <<EOF
+Speedrun a favorite level and log your time
+Try a new indie game and write a mini review
+Create a custom Minecraft build challenge
+Host a friendly game night tournament
+Learn a new puzzle game and share tips
+EOF
+      ;;
+    maker)
+      cat <<EOF
+3D print a useful household tool
+Solder a simple LED kit
+Upcycle something you’d toss
+Make a laser-cut or CNC project plan
+Build a tiny desk organizer
+EOF
+      ;;
+    adventurous)
+      cat <<EOF
+Plan a day trip to a new town
+Try a cuisine you’ve never had
+Ride a bus line to its end and explore
+Book a class you’ve always postponed
+Do one thing that scares you (safely)
+EOF
+      ;;
+  esac
+}
+
+select_top_tags() {
+  # Baseline from personality + learned scores
+  declare -A score=()
+  local t
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    case "$t" in
+      tech-savvy) t="tech" ;;
+      outdoorsy)  t="outdoors" ;;
+    esac
+    score["$t"]=$(( ${score["$t"]:-0} + 2 ))
+  done < <(jq -r '.personality.traits[]?' "$MEMORY_FILE")
+
+  while read -r k v; do
+    [ -z "${k:-}" ] && continue
+    score["$k"]=$(( ${score["$k"]:-0} + ${v:-0} ))
+  done < <(jq -r '.preferences.tag_scores | to_entries[]? | "\(.key) \(.value)"' "$MEMORY_FILE")
+
+  for base in tech outdoors creative social reflective active helper gamer maker adventurous; do
+    : "${score[$base]:=0}"
+  done
+
+  for k in "${!score[@]}"; do
+    printf "%s %s\n" "$k" "${score[$k]}"
+  done | sort -k2,2nr | awk '{print $1}' | head -n 5
+}
+
+generate_offline_ideas() {
+  local N="${1:-5}"
+  local -a seen=()
+  while IFS= read -r s; do [ -n "$s" ] && seen+=("$s"); done < <(jq -r '.preferences.likes[]?, .preferences.dislikes[]?' "$MEMORY_FILE")
+  local -a tags=()
+  while IFS= read -r tag; do [ -n "$tag" ] && tags+=("$tag"); done < <(select_top_tags)
+
+  local out=() tag idea skip s
+  for tag in "${tags[@]}"; do
+    while IFS= read -r idea; do
+      [ -z "$idea" ] && continue
+      skip=0
+      for s in "${seen[@]:-}"; do
+        [[ "$idea" == "$s" ]] && { skip=1; break; }
+      done
+      [ $skip -eq 1 ] && continue
+      out+=("$idea")
+      [ "${#out[@]}" -ge "$N" ] && break 2
+    done < <(offline_bank "$tag")
+  done
+  printf "%s\n" "${out[@]}"
+}
+
+# --------------- Amazon (no API key) -------------------
+
+urlencode() { jq -nr --arg s "$1" '$s|@uri'; }
+
+ask_amazon_open() {
+  local mode; mode="$(ini_get AMAZON_OPEN || true)"
+  case "${mode:-ask}" in
+    off) return 1 ;;
+    auto) return 0 ;;
+    *) whiptail --yesno "Want to search Amazon for items to help with this?" 10 70 ;;
+  esac
+}
+
+amazon_search() {
+  local query="$1"
+  local qenc; qenc="$(urlencode "$query")"
+  local url="https://www.amazon.com/s?k=${qenc}"
+  if require_cmd xdg-open; then
+    xdg-open "$url" >/dev/null 2>&1 || true
+    whiptail --msgbox "Opened Amazon search in your browser:\n\n${url}" 12 70
+  else
+    whiptail --msgbox "Copy this Amazon search URL:\n\n${url}\n\nTip: Install xdg-utils to auto-open." 14 70
+  fi
+  append_history "Opened Amazon search for: $query"
+}
+
+# --------------- LemonAI core -------------------
+
+lemonai_ideas() {
+  ensure_files
+  local name; name="$(ini_get NAME || echo Friend)"
+  local suggestions
+  suggestions="$(generate_offline_ideas 5)"
+  [ -z "$suggestions" ] && suggestions="$(generate_offline_ideas 5)"
+
+  local idea
+  while IFS= read -r idea; do
+    [ -z "$idea" ] && continue
+    whiptail --msgbox "💡 ${idea}" 10 70 || true
+
+    if whiptail --yesno "Do you like this idea?" 9 60; then
+      echo "$idea" >>"$WISHES_FILE"
+      append_like "$idea"
+      append_history "User liked idea: $idea"
+      while IFS= read -r tag; do [ -n "$tag" ] && bump_tag "$tag" 2; done < <(infer_tags "$idea")
+      if ask_amazon_open; then amazon_search "$idea"; fi
+    else
+      append_dislike "$idea"
+      append_history "User disliked idea: $idea"
+      while IFS= read -r tag; do [ -n "$tag" ] && bump_tag "$tag" -1; done < <(infer_tags "$idea")
+    fi
+  done <<<"$suggestions"
+
+  whiptail --msgbox "That’s all for now, $name! LemonAI will keep learning from your choices." 10 60
+}
+
+# --------------- Settings & Update -------------------
+
 settings_menu() {
-    while true; do
-        echo
-        echo "--- SETTINGS ---"
-        echo "1) CHANGE USERNAME"
-        echo "2) UPDATE"
-        echo "3) BACK"
-        read -r -p "Choose an option: " set_choice
+  while true; do
+    local ai_mode ai_endpoint amazon_open
+    ai_mode="$(ini_get AI_MODE || echo "$DEFAULT_AI_MODE")"
+    ai_endpoint="$(ini_get AI_ENDPOINT || echo "$DEFAULT_AI_ENDPOINT")"
+    amazon_open="$(ini_get AMAZON_OPEN || echo "$DEFAULT_AMAZON_OPEN")"
 
-        case "$set_choice" in
-            1)
-                read -r -p "Enter new username: " newname
-                [ -z "$newname" ] && continue
-                echo "NICKNAME=$newname" | sudo tee "$NAME_FILE" >/dev/null
-                nickname="$newname"
-                echo "Username updated to $nickname"
-                ;;
-            2)
-                update_script
-                ;;
-            3)
-                break
-                ;;
-            *)
-                echo "Invalid option."
-                ;;
-        esac
-    done
-}
-
-# --- Main menu ---
-while true; do
-    echo
-    echo "=== WISHNOW MENU ==="
-    echo "1) NEW WISH"
-    echo "2) WISHES"
-    echo "3) SETTINGS"
-    echo "4) EXIT"
-    read -r -p "Choose an option: " choice
+    local choice
+    choice=$(whiptail --title "Settings" --menu "Adjust preferences" 20 70 10 \
+      "1" "AI mode: ${ai_mode} (offline recommended; no keys needed)" \
+      "2" "AI endpoint: ${ai_endpoint:-<none>} (optional local server)" \
+      "3" "Amazon open: ${amazon_open} (ask/auto/off)" \
+      "4" "Re-run personality quiz" \
+      "5" "Back" 3>&1 1>&2 2>&3) || break
 
     case "$choice" in
-        1) new_wish ;;
-        2) show_wishes ;;
-        3) settings_menu ;;
-        4) echo "Goodbye!"; exit 0 ;;
-        *) echo "Invalid option." ;;
+      1)
+        local new
+        new=$(whiptail --title "AI mode" --menu "Choose AI mode" 12 50 3 \
+          "offline" "Use offline idea engine only" \
+          "online" "Use custom local endpoint (optional)" \
+          "cancel" "Back" 3>&1 1>&2 2>&3) || continue
+        [ "$new" = "cancel" ] || ini_set "AI_MODE" "$new"
+        ;;
+      2)
+        local ep
+        ep=$(whiptail --inputbox "Optional local endpoint (e.g., http://localhost:11434/api/generate)\nLeave blank to disable online calls." 12 70 "$ai_endpoint" 3>&1 1>&2 2>&3) || ep="$ai_endpoint"
+        ini_set "AI_ENDPOINT" "$ep"
+        ;;
+      3)
+        local mode
+        mode=$(whiptail --title "Amazon open" --menu "Choose behavior" 12 60 4 \
+          "ask"  "Ask every time" \
+          "auto" "Always open browser" \
+          "off"  "Never open automatically" \
+          "cancel" "Back" 3>&1 1>&2 2>&3) || continue
+        [ "$mode" = "cancel" ] || ini_set "AMAZON_OPEN" "$mode"
+        ;;
+      4) personality_quiz ;;
+      5) break ;;
     esac
-done
+  done
+}
+
+self_update() {
+  if ! require_cmd curl; then
+    whiptail --msgbox "curl is required for self-update.\nInstall: sudo apt install curl" 10 60
+    return
+  fi
+  local current_path new_file
+  # Resolve running script path
+  current_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  new_file="${TMP_DIR}/wishnow.new.sh"
+
+  whiptail --infobox "Checking for updates..." 7 40
+  if ! curl -fsSL "$GITHUB_RAW_URL" -o "$new_file"; then
+    whiptail --msgbox "Could not fetch update." 8 40
+    return
+  fi
+
+  if cmp -s "$current_path" "$new_file"; then
+    whiptail --msgbox "You already have the latest version." 8 40
+    rm -f "$new_file"
+    return
+  fi
+
+  if cp "$new_file" "$current_path" 2>/dev/null; then
+    chmod +x "$current_path"
+    whiptail --msgbox "Updated successfully. Restarting..." 8 50
+    exec "$current_path"
+  else
+    local fallback="${CONFIG_DIR}/wishnow.sh"
+    cp "$new_file" "$fallback"
+    chmod +x "$fallback"
+    whiptail --msgbox "No permission to overwrite $current_path.\nSaved new version to:\n$fallback\nRun it manually to switch." 12 70
+  fi
+}
+
+# --------------- Main menu -------------------
+
+main_menu() {
+  while true; do
+    local choice
+    choice=$(whiptail --title "$APP_NAME" --menu "Choose an option" 20 70 10 \
+      "1" "Add a wish" \
+      "2" "View wishes" \
+      "3" "Manage wishes (delete)" \
+      "4" "LemonAI – Ideas for me" \
+      "5" "Personality setup" \
+      "6" "Settings" \
+      "7" "Update WISHNOW" \
+      "8" "Exit" 3>&1 1>&2 2>&3) || break
+
+    case "$choice" in
+      1) add_wish_manual ;;
+      2) view_wishes ;;
+      3) manage_wishes ;;
+      4) lemonai_ideas ;;
+      5) personality_quiz ;;
+      6) settings_menu ;;
+      7) self_update ;;
+      8) break ;;
+    esac
+  done
+}
+
+# --------------- Bootstrap -------------------
+
+ensure_deps
+ensure_files
+
+# If first run (no name in settings), start onboarding
+if [ -z "$(ini_get NAME || true)" ]; then
+  splash
+  first_run
+fi
+
+main_menu
