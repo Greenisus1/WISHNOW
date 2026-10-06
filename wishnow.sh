@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # WISHNOW — single-file, offline-first, no-AI
-# Author: Liam Winnie
 
 set +e
 
@@ -77,14 +76,14 @@ ui_menu() {
     whiptail --title "$title" --menu "$prompt" 20 70 10 "$@" 3>&1 1>&2 2>&3
     return $?
   else
-    printf "\n== %s ==\n%s\n" "$title" "$prompt"
+    printf "\n== %s ==\n%s\n" "$title" "$prompt" >&2
     local keys=() descs=()
     while [ "$#" -gt 0 ]; do
       keys+=("$1"); shift
       descs+=("$1"); shift
     done
     for idx in "${!keys[@]}"; do
-      printf "  %2d) %s — %s\n" "$((idx+1))" "${keys[$idx]}" "${descs[$idx]}"
+      printf "  %2d) %s - %s\n" "$((idx+1))" "${keys[$idx]}" "${descs[$idx]}" >&2
     done
     read -r -p "Choose number: " n
     if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#keys[@]}" ]; then
@@ -104,7 +103,7 @@ ui_checklist() {
     whiptail --title "$title" --checklist "$prompt" 20 70 12 "$@" 3>&1 1>&2 2>&3
     return $?
   else
-    printf "\n== %s ==\n%s\n" "$title" "$prompt"
+    printf "\n== %s ==\n%s\n" "$title" "$prompt" >&2
     local keys=() descs=()
     while [ "$#" -gt 0 ]; do
       keys+=("$1"); shift
@@ -112,7 +111,7 @@ ui_checklist() {
       shift || true
     done
     for idx in "${!keys[@]}"; do
-      printf "  %2d) %s — %s\n" "$((idx+1))" "${keys[$idx]}" "${descs[$idx]}"
+      printf "  %2d) %s - %s\n" "$((idx+1))" "${keys[$idx]}" "${descs[$idx]}" >&2
     done
     read -r -p "Enter numbers separated by commas (e.g., 1,3,5): " line
     line="${line// /}"
